@@ -28,6 +28,7 @@ from datetime import datetime
 import re
 from src.chat.knowledge.knowledge_lib import qa_manager
 from src.chat.focus_chat.memory_activator import MemoryActivator
+from src.tools.tool_executor import ToolExecutor
 
 logger = get_logger("replyer")
 
@@ -42,7 +43,8 @@ def init_prompt():
     Prompt(
         """
 {expression_habits_block}
-{structured_info_block}
+{tool_info_block}
+{knowledge_prompt}
 {memory_block}
 {relation_info_block}
 {extra_info_block}
@@ -67,7 +69,8 @@ def init_prompt():
     Prompt(
         """
 {expression_habits_block}
-{structured_info_block}
+{tool_info_block}
+{knowledge_prompt}
 {memory_block}
 {relation_info_block}
 {extra_info_block}
@@ -136,19 +139,28 @@ class DefaultReplyer:
     def __init__(
         self,
         chat_stream: ChatStream,
+        enable_tool: bool = False,
         model_configs: Optional[List[Dict[str, Any]]] = None,
         request_type: str = "focus.replyer",
     ):
         self.log_prefix = "replyer"
         self.request_type = request_type
 
+        self.enable_tool = enable_tool
+
         if model_configs:
             self.express_model_configs = model_configs
         else:
             # 当未提供配置时，使用默认配置并赋予默认权重
-            default_config = global_config.model.replyer_1.copy()
-            default_config.setdefault("weight", 1.0)
-            self.express_model_configs = [default_config]
+
+            model_config_1 = global_config.model.replyer_1.copy()
+            model_config_2 = global_config.model.replyer_2.copy()
+            prob_first = global_config.chat.replyer_random_probability
+
+            model_config_1["weight"] = prob_first
+            model_config_2["weight"] = 1.0 - prob_first
+
+            self.express_model_configs = [model_config_1, model_config_2]
 
         if not self.express_model_configs:
             logger.warning("未找到有效的模型配置，回复生成可能会失败。")
@@ -157,11 +169,12 @@ class DefaultReplyer:
             fallback_config.setdefault("weight", 1.0)
             self.express_model_configs = [fallback_config]
 
-        self.heart_fc_sender = HeartFCSender()
-        self.memory_activator = MemoryActivator()
-
         self.chat_stream = chat_stream
         self.is_group_chat, self.chat_target_info = get_chat_type_and_target_info(self.chat_stream.stream_id)
+
+        self.heart_fc_sender = HeartFCSender()
+        self.memory_activator = MemoryActivator()
+        self.tool_executor = ToolExecutor(chat_id=self.chat_stream.stream_id, enable_cache=True, cache_ttl=3)
 
     def _select_weighted_model_config(self) -> Dict[str, Any]:
         """使用加权随机选择来挑选一个模型配置"""
@@ -205,7 +218,6 @@ class DefaultReplyer:
         reply_data: Dict[str, Any] = None,
         reply_to: str = "",
         relation_info: str = "",
-        structured_info: str = "",
         extra_info: str = "",
         available_actions: List[str] = None,
     ) -> Tuple[bool, Optional[str]]:
@@ -222,7 +234,6 @@ class DefaultReplyer:
                 reply_data = {
                     "reply_to": reply_to,
                     "relation_info": relation_info,
-                    "structured_info": structured_info,
                     "extra_info": extra_info,
                 }
                 for key, value in reply_data.items():
@@ -380,7 +391,7 @@ class DefaultReplyer:
 
     async def build_memory_block(self, chat_history, target):
         running_memorys = await self.memory_activator.activate_memory_with_chat_history(
-            chat_id=self.chat_stream.stream_id, target_message=target, chat_history_prompt=chat_history
+            target_message=target, chat_history_prompt=chat_history
         )
 
         if running_memorys:
@@ -393,6 +404,51 @@ class DefaultReplyer:
             memory_block = ""
 
         return memory_block
+
+    async def build_tool_info(self, reply_data=None, chat_history=None):
+        """构建工具信息块
+
+        Args:
+            reply_data: 回复数据，包含要回复的消息内容
+            chat_history: 聊天历史
+
+        Returns:
+            str: 工具信息字符串
+        """
+        if not reply_data:
+            return ""
+
+        reply_to = reply_data.get("reply_to", "")
+        sender, text = self._parse_reply_target(reply_to)
+
+        if not text:
+            return ""
+
+        try:
+            # 使用工具执行器获取信息
+            tool_results = await self.tool_executor.execute_from_chat_message(
+                sender=sender, target_message=text, chat_history=chat_history, return_details=False
+            )
+
+            if tool_results:
+                tool_info_str = "以下是你通过工具获取到的实时信息：\n"
+                for tool_result in tool_results:
+                    tool_name = tool_result.get("tool_name", "unknown")
+                    content = tool_result.get("content", "")
+                    result_type = tool_result.get("type", "info")
+
+                    tool_info_str += f"- 【{tool_name}】{result_type}: {content}\n"
+
+                tool_info_str += "以上是你获取到的实时信息，请在回复时参考这些信息。"
+                logger.info(f"{self.log_prefix} 获取到 {len(tool_results)} 个工具结果")
+                return tool_info_str
+            else:
+                logger.debug(f"{self.log_prefix} 未获取到任何工具结果")
+                return ""
+
+        except Exception as e:
+            logger.error(f"{self.log_prefix} 工具信息获取失败: {e}")
+            return ""
 
     def _parse_reply_target(self, target_message: str) -> tuple:
         sender = ""
@@ -457,8 +513,6 @@ class DefaultReplyer:
         person_info_manager = get_person_info_manager()
         bot_person_id = person_info_manager.get_person_id("system", "bot_id")
         is_group_chat = bool(chat_stream.group_info)
-
-        structured_info = reply_data.get("structured_info", "")
         reply_to = reply_data.get("reply_to", "none")
         extra_info_block = reply_data.get("extra_info", "") or reply_data.get("extra_info_block", "")
 
@@ -502,21 +556,22 @@ class DefaultReplyer:
             show_actions=True,
         )
 
-        # 并行执行三个构建任务
-        expression_habits_block, relation_info, memory_block = await asyncio.gather(
+        # 并行执行四个构建任务
+        expression_habits_block, relation_info, memory_block, tool_info = await asyncio.gather(
             self.build_expression_habits(chat_talking_prompt_half, target),
             self.build_relation_info(reply_data, chat_talking_prompt_half),
             self.build_memory_block(chat_talking_prompt_half, target),
+            self.build_tool_info(reply_data, chat_talking_prompt_half),
         )
 
         keywords_reaction_prompt = await self.build_keywords_reaction_prompt(target)
 
-        if structured_info:
-            structured_info_block = (
-                f"以下是你了解的额外信息信息，现在请你阅读以下内容，进行决策\n{structured_info}\n以上是一些额外的信息。"
+        if tool_info:
+            tool_info_block = (
+                f"以下是你了解的额外信息信息，现在请你阅读以下内容，进行决策\n{tool_info}\n以上是一些额外的信息。"
             )
         else:
-            structured_info_block = ""
+            tool_info_block = ""
 
         if extra_info_block:
             extra_info_block = f"以下是你在回复时需要参考的信息，现在请你阅读以下内容，进行决策\n{extra_info_block}\n以上是你在回复时需要参考的信息，现在请你阅读以下内容，进行决策"
@@ -589,7 +644,8 @@ class DefaultReplyer:
                 chat_target=chat_target_1,
                 chat_info=chat_talking_prompt,
                 memory_block=memory_block,
-                structured_info_block=structured_info_block,
+                tool_info_block=tool_info_block,
+                knowledge_prompt=prompt_info,
                 extra_info_block=extra_info_block,
                 relation_info_block=relation_info,
                 time_block=time_block,
@@ -619,7 +675,8 @@ class DefaultReplyer:
                 chat_target=chat_target_1,
                 chat_info=chat_talking_prompt,
                 memory_block=memory_block,
-                structured_info_block=structured_info_block,
+                tool_info_block=tool_info_block,
+                knowledge_prompt=prompt_info,
                 relation_info_block=relation_info,
                 extra_info_block=extra_info_block,
                 time_block=time_block,
